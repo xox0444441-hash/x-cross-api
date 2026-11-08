@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: x-cross-api
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: HF_TOKEN
+        sync: false
+      - key: X_CROSS_MODEL_ID
+        sync: false
+      - key: X_API_KEY
+        sync: false
