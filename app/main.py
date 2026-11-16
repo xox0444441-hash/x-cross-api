@@ -167,4 +167,4 @@ async def chat(
         raise HTTPException(
             status_code=502,
             detail="Invalid response from DeepInfra"
-        )
+)
