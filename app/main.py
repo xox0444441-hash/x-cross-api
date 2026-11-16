@@ -1,5 +1,5 @@
-
 import os
+import time
 import httpx
 from typing import Any
 
@@ -9,18 +9,22 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="X-CROSS API",
-    version="1.1.0"
+    version="1.2.0"
 )
 
-# DeepInfra Configuration
-DEEPINFRA_API_KEY = os.getenv("DEEPINFRA_API_KEY", "")
+# Google Gemini Configuration
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+
 MODEL_ID = os.getenv(
     "X_CROSS_MODEL_ID",
-    "Qwen/Qwen3.5-9B"
+    "gemini-3.1-flash-lite"
 )
 
-DEEPINFRA_URL = (
-    "https://api.deepinfra.com/v1/openai/chat/completions"
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/"
+    "v1beta/models/"
+    + MODEL_ID
+    + ":generateContent"
 )
 
 # Optional X-CROSS API security key
@@ -44,7 +48,9 @@ async def home():
     return {
         "name": "X-CROSS API",
         "status": "online",
-        "version": "1.1.0"
+        "version": "1.2.0",
+        "provider": "Google Gemini",
+        "model": MODEL_ID
     }
 
 
@@ -58,8 +64,8 @@ async def ready():
 
     missing = []
 
-    if not DEEPINFRA_API_KEY:
-        missing.append("DEEPINFRA_API_KEY")
+    if not GOOGLE_API_KEY:
+        missing.append("GOOGLE_API_KEY")
 
     if not MODEL_ID:
         missing.append("X_CROSS_MODEL_ID")
@@ -75,7 +81,7 @@ async def ready():
 
     return {
         "status": "ready",
-        "provider": "DeepInfra",
+        "provider": "Google Gemini",
         "model": MODEL_ID
     }
 
@@ -96,11 +102,11 @@ async def chat(
             detail="Invalid API key"
         )
 
-    # Check DeepInfra API Key
-    if not DEEPINFRA_API_KEY:
+    # Check Google API Key
+    if not GOOGLE_API_KEY:
         raise HTTPException(
             status_code=503,
-            detail="Configure DEEPINFRA_API_KEY"
+            detail="Configure GOOGLE_API_KEY"
         )
 
     if data.stream:
@@ -109,16 +115,67 @@ async def chat(
             detail="Streaming is not supported yet"
         )
 
+    contents = []
+    system_parts = []
+
+    for message in data.messages:
+
+        if not isinstance(message.content, str):
+            raise HTTPException(
+                status_code=422,
+                detail="Message content must be a string"
+            )
+
+        if message.role == "system":
+
+            system_parts.append({
+                "text": message.content
+            })
+
+        elif message.role == "user":
+
+            contents.append({
+                "role": "user",
+                "parts": [
+                    {"text": message.content}
+                ]
+            })
+
+        elif message.role == "assistant":
+
+            contents.append({
+                "role": "model",
+                "parts": [
+                    {"text": message.content}
+                ]
+            })
+
+        else:
+
+            raise HTTPException(
+                status_code=422,
+                detail="Unsupported message role"
+            )
+
+    if not contents:
+        raise HTTPException(
+            status_code=422,
+            detail="A user message is required"
+        )
+
+    # Gemini Request Body
     body = {
-        "model": MODEL_ID,
-        "messages": [
-            message.model_dump()
-            for message in data.messages
-        ],
-        "max_tokens": data.max_tokens,
-        "temperature": data.temperature,
-        "stream": False
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": data.max_tokens,
+            "temperature": data.temperature
+        }
     }
+
+    if system_parts:
+        body["systemInstruction"] = {
+            "parts": system_parts
+        }
 
     try:
 
@@ -127,12 +184,10 @@ async def chat(
         ) as client:
 
             response = await client.post(
-                DEEPINFRA_URL,
+                GEMINI_URL,
                 json=body,
                 headers={
-                    "Authorization": (
-                        f"Bearer {DEEPINFRA_API_KEY}"
-                    ),
+                    "x-goog-api-key": GOOGLE_API_KEY,
                     "Content-Type": "application/json"
                 }
             )
@@ -141,30 +196,123 @@ async def chat(
 
         raise HTTPException(
             status_code=504,
-            detail="DeepInfra request timed out"
+            detail="Google Gemini request timed out"
         )
 
     except httpx.RequestError:
 
         raise HTTPException(
             status_code=502,
-            detail="Cannot reach DeepInfra"
+            detail="Cannot reach Google Gemini"
         )
 
     if response.is_error:
 
+        try:
+            error_data = response.json()
+            detail = error_data.get(
+                "error", {}
+            ).get(
+                "message",
+                response.text
+            )
+        except ValueError:
+            detail = response.text
+
         raise HTTPException(
             status_code=response.status_code,
-            detail=response.text[:2000]
+            detail=str(detail)[:2000]
         )
 
     try:
 
-        return response.json()
+        result = response.json()
 
     except ValueError:
 
         raise HTTPException(
             status_code=502,
-            detail="Invalid response from DeepInfra"
-)
+            detail="Invalid Gemini response"
+        )
+
+    candidates = result.get("candidates", [])
+
+    if not candidates:
+
+        reason = result.get(
+            "promptFeedback", {}
+        ).get(
+            "blockReason",
+            "No response returned"
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini returned no answer: {reason}"
+        )
+
+    candidate = candidates[0]
+
+    parts = candidate.get(
+        "content", {}
+    ).get(
+        "parts", []
+    )
+
+    answer = "".join(
+        part.get("text", "")
+        for part in parts
+        if isinstance(part, dict)
+    )
+
+    if not answer:
+
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini returned an empty response"
+        )
+
+    usage = result.get("usageMetadata", {})
+
+    finish_reason = candidate.get(
+        "finishReason", "STOP"
+    )
+
+    finish_map = {
+        "STOP": "stop",
+        "MAX_TOKENS": "length",
+        "SAFETY": "content_filter"
+    }
+
+    # OpenAI Compatible Response
+    return {
+        "id": f"x-cross-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": MODEL_ID,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": answer
+                },
+                "finish_reason": finish_map.get(
+                    finish_reason,
+                    finish_reason.lower()
+                )
+            }
+        ],
+        "usage": {
+            "prompt_tokens": usage.get(
+                "promptTokenCount", 0
+            ),
+            "completion_tokens": usage.get(
+                "candidatesTokenCount", 0
+            ),
+            "total_tokens": usage.get(
+                "totalTokenCount", 0
+            )
+        }
+    }
+import
